@@ -22,6 +22,7 @@ import warnings
 
 from horovod.common.basics import HorovodBasics as _HorovodBasics
 from horovod.common.exceptions import HorovodInternalError
+from horovod.common.process_sets import _setup as _setup_process_sets
 from horovod.common.util import check_installed_version, get_average_backwards_compatibility_fun, gpu_available, num_rank_is_power_2
 
 from horovod.torch.compression import Compression
@@ -71,6 +72,8 @@ Adasum = _basics.Adasum
 is_homogeneous = _basics.is_homogeneous
 
 handle_average_backwards_compatibility = get_average_backwards_compatibility_fun(_basics)
+
+_setup_process_sets(_basics)
 
 
 # Schema: handle -> input, output
@@ -518,8 +521,11 @@ def sparse_allreduce_async(tensor, name, op):
     values_handle = allgather_async(t._values(), name=f'{name}.values')
 
     def handle():
-        indices = synchronize(indices_handle)
+        # We need to sync values handle firstly for torch nightly >= 10.0
+        # Issue: https://github.com/horovod/horovod/issues/2961
         values = synchronize(values_handle)
+        indices = synchronize(indices_handle)
+
         values = (values / size()) if op == Average else values
 
         if indices.dim() == 0 or values.dim() == 0:

@@ -1183,7 +1183,7 @@ class MXTests(unittest.TestCase):
                 for key, param in params.items():
                     hvd.allreduce_(param.list_data()[0])
                 cnt = 0
-    
+
     def test_compression_fp16(self):
         valid_dtypes = ['float16', 'float32', 'float64']
         invalid_dtypes = ['uint8', 'int8', 'int32', 'int64']

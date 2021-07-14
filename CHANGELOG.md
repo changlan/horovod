@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- Added process sets for TensorFlow: Concurrently running collective operations on subsets of Horovod processes. ([#2839](https://github.com/horovod/horovod/pull/2839))
+
 ### Changed
 
 ### Deprecated
@@ -15,6 +17,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Removed
 
 ### Fixed
+
+## [v0.22.1] - 2021-06-10
+
+### Added
+
+- Estimator: added support for loading data from S3, GCS, ADLS, and other remote filesystems. ([#2927](https://github.com/horovod/horovod/issues/2927))
+
+- Estimator: added custom Spark data loader interface. ([#2938](https://github.com/horovod/horovod/issues/2923))
+
+- LightningEstimator: added support to supply a logger and associated parameter to control the frequency of logging. ([#2926](https://github.com/horovod/horovod/pull/2926))
+
+- Estimator: added check to ensure all ranks have the same device type. ([#2942](https://github.com/horovod/horovod/pull/2942))
+
+### Changed
+
+- Changed behavior from using TensorBoardLogger to now using it as a fallback if a logger is not supplied. ([#2926](https://github.com/horovod/horovod/pull/2926))
+
+- Ray: disabled capturing child tasks in placement group. ([#2920](https://github.com/horovod/horovod/pull/2920))
+
+### Fixed
+
+- Fixed `hvd.tensorflow.keras.Compression`, accidentally removed in v0.22.0. ([#2945](https://github.com/horovod/horovod/pull/2945))
+
+- TorchEstimator: fixed usage of `validation_steps` in place of `validation_steps_per_epoch`. ([#2918](https://github.com/horovod/horovod/pull/2918))
+
+- TensorFlow: fixed C++ API for TF v2.6.0. ([#2932](https://github.com/horovod/horovod/pull/2932))
+
+- PyTorch: fixed `sparse_allreduce_async` for PyTorch v0.10.0. ([#2965](https://github.com/horovod/horovod/pull/2965))
 
 ## [v0.22.0] - 2021-05-18
 

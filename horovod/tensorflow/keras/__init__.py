@@ -14,6 +14,7 @@
 # ==============================================================================
 
 import inspect
+import warnings
 
 import tensorflow as tf
 
@@ -23,15 +24,13 @@ from tensorflow.python.keras import backend as K
 from horovod.tensorflow import init
 from horovod.tensorflow import shutdown
 from horovod.tensorflow import is_initialized, start_timeline, stop_timeline
-from horovod.tensorflow import size
-from horovod.tensorflow import local_size
-from horovod.tensorflow import rank
-from horovod.tensorflow import local_rank
+from horovod.tensorflow import size, local_size, cross_size, rank, local_rank, cross_rank
 from horovod.tensorflow import mpi_threads_supported, mpi_enabled, mpi_built
 from horovod.tensorflow import gloo_enabled, gloo_built
+from horovod.tensorflow.mpi_ops import ProcessSet, global_process_set, add_process_set, remove_process_set
 from horovod.tensorflow import nccl_built, ddl_built, ccl_built, cuda_built, rocm_built
 from horovod.tensorflow import Average, Sum
-from horovod.tensorflow import compression
+from horovod.tensorflow.compression import Compression
 
 
 import horovod._keras as _impl
@@ -49,14 +48,15 @@ except:
 
 def DistributedOptimizer(optimizer, name=None,
                          device_dense='', device_sparse='',
-                         compression=compression.Compression.none,
+                         compression=Compression.none,
                          sparse_as_dense=False,
                          gradient_predivide_factor=1.0,
                          op=Average,
                          backward_passes_per_step=1,
                          average_aggregated_gradients=False,
                          num_groups=0,
-                         groups=None):
+                         groups=None,
+                         process_set=global_process_set):
     """
     An optimizer that wraps another keras.optimizers.Optimizer, using an allreduce to
     average gradient values before applying gradients to model weights.
@@ -101,6 +101,8 @@ def DistributedOptimizer(optimizer, name=None,
                 inner list will be assigned to the same group, while parameter that does
                 not appear in any list will form a group itself.
                 Defaults as None, which is no explicit groups.
+      process_set: Gradients will only be reduced over Horovod processes belonging
+                   to this process set. Defaults to the global process set.
     """
     if gradient_predivide_factor != 1.0 and rocm_built():
             raise ValueError('gradient_predivide_factor not supported yet with ROCm')
@@ -132,6 +134,7 @@ def DistributedOptimizer(optimizer, name=None,
         backward_passes_per_step=backward_passes_per_step,
         average_aggregated_gradients=average_aggregated_gradients,
         groups=groups,
+        process_set=process_set,
     )
 
 
@@ -149,7 +152,7 @@ def allreduce(value, name=None, average=None,
               prescale_factor=1.0,
               postscale_factor=1.0,
               op=None,
-              compression=compression.Compression.none):
+              compression=Compression.none):
     """
     Perform an allreduce on a tensor-compatible value.
 
@@ -210,7 +213,7 @@ def broadcast(value, root_rank, name=None):
     return _impl.broadcast(K, value, root_rank, name)
 
 
-def load_model(filepath, custom_optimizers=None, custom_objects=None, compression=compression.Compression.none):
+def load_model(filepath, custom_optimizers=None, custom_objects=None, compression=Compression.none):
     """
     Loads a saved Keras model with a Horovod DistributedOptimizer.
 

@@ -95,8 +95,7 @@ def train_model(args):
             self.fc2 = nn.Linear(50, 10)
 
         def forward(self, x):
-            #raise RuntimeError("x shape is {}".format(x.shape))
-            x = x.float()
+            x = x.float().reshape((-1, 1, 28, 28))
             x = F.relu(F.max_pool2d(self.conv1(x), 2))
             x = F.relu(F.max_pool2d(self.conv2_drop(self.conv2(x)), 2))
             x = x.view(-1, 320)
@@ -108,22 +107,26 @@ def train_model(args):
         def configure_optimizers(self):
             return optim.SGD(self.parameters(), lr=0.01, momentum=0.5)
 
-        def training_step(self, batch, batch_nb):
+        def training_step(self, batch, batch_idx):
+            if batch_idx == 0:
+                print(f"training data batch size: {batch['label'].shape}")
             x, y = batch['features'], batch['label']
             y_hat = self(x)
             loss = F.nll_loss(y_hat, y.long())
-            tensorboard_logs = {'train_loss': loss}
-            return {'loss': loss, 'log': tensorboard_logs}
+            self.log('train_loss', loss)
+            return loss
 
-        def validation_step(self, batch, batch_nb):
+        def validation_step(self, batch, batch_idx):
+            if batch_idx == 0:
+                print(f"validation data batch size: {batch['label'].shape}")
             x, y = batch['features'], batch['label']
             y_hat = self(x)
-            return {'val_loss': F.nll_loss(y_hat, y.long())}
+            loss = F.nll_loss(y_hat, y.long())
+            self.log('val_loss', loss)
 
         def validation_epoch_end(self, outputs):
-            avg_loss = torch.stack([x['val_loss'] for x in outputs]).mean()
-            tensorboard_logs = {'val_loss': avg_loss}
-            return {'avg_val_loss': avg_loss, 'log': tensorboard_logs}
+            avg_loss = torch.stack([x['val_loss'] for x in outputs]).mean() if len(outputs) > 0 else float('inf')
+            self.log('avg_val_loss', avg_loss)
 
     model = Net()
 
@@ -140,6 +143,7 @@ def train_model(args):
         def __init__(self):
             self.epcoh_end_counter = 0
             self.train_epcoh_end_counter = 0
+            self.validation_epoch_end_counter = 0
 
         def on_init_start(self, trainer):
             print('Starting to init trainer!')
@@ -155,12 +159,30 @@ def train_model(args):
             print('A train epoch ended.')
             self.train_epcoh_end_counter += 1
 
+        def on_validation_epoch_end(self, trainer, model, unused=None):
+            print('A val epoch ended.')
+            self.validation_epoch_end_counter += 1
+
         def on_train_end(self, trainer, model):
-            print('Training ends')
-            assert self.epcoh_end_counter == 2 * epochs
-            assert self.train_epcoh_end_counter == epochs
+            print("Training ends:"
+                  f"epcoh_end_counter={self.epcoh_end_counter}, "
+                  f"train_epcoh_end_counter={self.train_epcoh_end_counter}, "
+                  f"validation_epoch_end_counter={self.validation_epoch_end_counter} \n")
+            assert self.train_epcoh_end_counter <= epochs
+            assert self.epcoh_end_counter == self.train_epcoh_end_counter + self.validation_epoch_end_counter
 
     callbacks = [MyDummyCallback()]
+
+    # added EarlyStopping and ModelCheckpoint
+    from pytorch_lightning.callbacks.model_checkpoint import ModelCheckpoint
+    callbacks.append(ModelCheckpoint(dirpath=args.work_dir))
+
+    from pytorch_lightning.callbacks.early_stopping import EarlyStopping
+    callbacks.append(EarlyStopping(monitor='val_loss',
+                                   min_delta=0.00,
+                                   patience=3,
+                                   verbose=True,
+                                   mode='max'))
 
     torch_estimator = hvd.TorchEstimator(backend=backend,
                                          store=store,
@@ -168,9 +190,9 @@ def train_model(args):
                                          input_shapes=[[-1, 1, 28, 28]],
                                          feature_cols=['features'],
                                          label_cols=['label'],
-                                         validation=0.1,
                                          batch_size=args.batch_size,
                                          epochs=args.epochs,
+                                         validation=0.1,
                                          verbose=1,
                                          callbacks=callbacks)
 

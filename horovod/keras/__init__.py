@@ -13,21 +13,20 @@
 # limitations under the License.
 # ==============================================================================
 
+import warnings
+
 import keras
 import keras.backend as K
 
 from horovod.tensorflow import init
 from horovod.tensorflow import shutdown
-from horovod.tensorflow import size
+from horovod.tensorflow import size, local_size, cross_size, rank, local_rank, cross_rank
 from horovod.tensorflow import is_initialized, start_timeline, stop_timeline
-from horovod.tensorflow import local_size
-from horovod.tensorflow import rank
-from horovod.tensorflow import local_rank
 from horovod.tensorflow import mpi_threads_supported, mpi_enabled, mpi_built
 from horovod.tensorflow import gloo_enabled, gloo_built
 from horovod.tensorflow import nccl_built, ddl_built, ccl_built, cuda_built, rocm_built
 from horovod.tensorflow import Average, Sum
-from horovod.tensorflow import compression
+from horovod.tensorflow.compression import Compression
 
 
 from horovod.keras import callbacks, elastic
@@ -36,7 +35,7 @@ import horovod._keras as _impl
 
 def DistributedOptimizer(optimizer, name=None,
                          device_dense='', device_sparse='',
-                         compression=compression.Compression.none,
+                         compression=Compression.none,
                          sparse_as_dense=False,
                          gradient_predivide_factor=1.0,
                          op=Average,
@@ -165,7 +164,7 @@ def broadcast(value, root_rank, name=None):
     return _impl.broadcast(K, value, root_rank, name)
 
 
-def load_model(filepath, custom_optimizers=None, custom_objects=None, compression=compression.Compression.none):
+def load_model(filepath, custom_optimizers=None, custom_objects=None, compression=Compression.none):
     """
     Loads a saved Keras model with a Horovod DistributedOptimizer.
 
