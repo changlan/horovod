@@ -21,7 +21,7 @@ import numbers
 import os
 import time
 import warnings
-from distutils.version import LooseVersion
+from packaging import version
 
 from pyspark import keyword_only
 from pyspark.ml.param.shared import Param, Params, TypeConverters
@@ -135,15 +135,18 @@ class TorchEstimator(HorovodEstimator, TorchEstimatorParamsWritable,
                     for training. Not needed for lightning model.
         partitions_per_process: (Optional) Number of Parquet partitions to assign per worker
                                 process from `num_proc` (default: 10).
-        reader_pool_type:   (Optional) Type of worker pool used to parallelize reading data from
-                            the dataset. Should be one of ['thread', 'process']. Defaults to
-                            'process'.
+        reader_pool_type:   (Optional) Type of Petastorm worker pool used to parallelize reading data from
+                            the dataset. Should be one of ['thread', 'process', 'dummy']. Defaults to
+                            'thread'.
         run_id:     (Optional) unique ID for this run for organization in the Store. Will be
                     automatically assigned if not provided.
         sample_weight_col:  (Optional) column indicating the weight of each sample.
-        shuffle_buffer_size: Optional size of in-memory shuffle buffer in rows. Allocating a larger
-                             buffer size increases randomness of shuffling at the cost of more host memory. Defaults to estimating with an assumption of 4GB of memory per
-                             host.
+        random_seed: Optional random seed to use for PyTorch Lightning. Default: None.
+        shuffle_buffer_size: (Deprecated) Optional size of in-memory shuffle buffer in rows (on training data).
+                             Allocating a larger buffer size increases randomness of shuffling at
+                             the cost of more host memory. Defaults to estimating with an assumption
+                             of 4GB of memory per host. Set shuffle_buffer_size=0 would turn off shuffle.
+        shuffle: (Optional) Whether to shuffle training samples or not. Defaults to True.
         store:      Store object that abstracts reading and writing of intermediate data and
                     run results.
         terminate_on_nan : (Optinoal) terminate the training process on seeing NaN output.
@@ -160,12 +163,19 @@ class TorchEstimator(HorovodEstimator, TorchEstimatorParamsWritable,
         train_steps_per_epoch: (Optional) Number of steps to train each epoch. Useful for testing
                                 that model trains successfully. Defaults to training the entire
                                 dataset each epoch.
+        trainer_args:   (Optional) Dict of args to pass to trainer, it will be used to add/override the args which estimator gives to trainer.
         transformation_fn:  (Optional) function that takes a row as its parameter and returns a
                             modified row that is then fed into the train or validation step.
                             This transformation is applied after batching. See Petastorm
                             [TransformSpec](https://github.com/uber/petastorm/blob/master/petastorm/transform.py)
                             for more details. Note that this fucntion constructs another function
                             which should perform the transformation.
+        transformation_edit_fields: (Optional) A list of 4-tuples with the following fields:
+                            ``(name, numpy_dtype, shape, is_nullable)`` used for Petastorm 
+                            [TransformSpec](https://github.com/uber/petastorm/blob/master/petastorm/transform.py)
+                            to add more fields into the schema.
+        transformation_removed_fields: (Optional). A list of field names that will be removed from the original schema
+                            used for Petastorm [TransformSpec](https://github.com/uber/petastorm/blob/master/petastorm/transform.py).
         val_batch_size: Number of rows from the DataFrame per batch for validation, if not set,
                          will use batch_size.
         val_reader_num_workers: Similar to the train_reader_num_workers.
@@ -175,6 +185,11 @@ class TorchEstimator(HorovodEstimator, TorchEstimatorParamsWritable,
         validation_steps_per_epoch: (Optional) Number of validation steps to perform each epoch.
         verbose:    (Optional)Verbosity level, 0 for silent. (default: 1).
         profiler:    (Optional)Lightning profiler to enable. (disabled by default).
+        debug_data_loader: (Optional)Debugging flag for data loader.
+        train_async_data_loader_queue_size: (Optional) Size of train async data loader queue.
+        val_async_data_loader_queue_size: (Optional) Size of val async data loader queue.
+        use_gpu: Whether to use the GPU for training. Defaults to True.
+        mp_start_method: The method to use to start multiprocessing. Defaults to None.
     """
 
     input_shapes = Param(Params._dummy(), 'input_shapes', 'input layer shapes')
@@ -182,10 +197,6 @@ class TorchEstimator(HorovodEstimator, TorchEstimatorParamsWritable,
                               'functions that construct the loss')
     train_minibatch_fn = Param(Params._dummy(), 'train_minibatch_fn',
                                'functions that construct the minibatch train function for torch')
-
-    inmemory_cache_all = Param(Params._dummy(), 'inmemory_cache_all',
-                               'Cache the data in memory for training and validation.',
-                               typeConverter=TypeConverters.toBoolean)
 
     num_gpus = Param(Params._dummy(), 'num_gpus',
                      'Number of gpus per process, default to 1 when CUDA is available in the backend, otherwise 0.')
@@ -206,8 +217,14 @@ class TorchEstimator(HorovodEstimator, TorchEstimatorParamsWritable,
 
     profiler = Param(Params._dummy(), 'profiler', 'lightning profiler to use')
 
-    checkpoint_callback = Param(Params._dummy(), 'checkpoint_callback',
-                                'model checkpointing callback')
+    trainer_args = Param(Params._dummy(), 'trainer_args',
+                        'Dict of args to pass to trainer, it will be used to add/override the args which estimator gives to trainer. ')
+
+    debug_data_loader = Param(Params._dummy(), 'debug_data_loader', 'Flag to enable debug for data laoder.')
+
+    train_async_data_loader_queue_size = Param(Params._dummy(), 'train_async_data_loader_queue_size', 'Size of train async data loader queue.')
+
+    val_async_data_loader_queue_size = Param(Params._dummy(), 'val_async_data_loader_queue_size', 'Size of val async data loader queue.')
 
     @keyword_only
     def __init__(self,
@@ -231,14 +248,19 @@ class TorchEstimator(HorovodEstimator, TorchEstimatorParamsWritable,
                  val_batch_size=None,
                  epochs=None,
                  verbose=1,
+                 random_seed=None,
                  shuffle_buffer_size=None,
+                 shuffle=True,
                  partitions_per_process=None,
                  run_id=None,
                  train_minibatch_fn=None,
                  train_steps_per_epoch=None,
                  validation_steps_per_epoch=None,
                  transformation_fn=None,
+                 transformation_edit_fields=None,
+                 transformation_removed_fields=None,
                  train_reader_num_workers=None,
+                 trainer_args=None,
                  val_reader_num_workers=None,
                  reader_pool_type=None,
                  label_shapes=None,
@@ -250,14 +272,17 @@ class TorchEstimator(HorovodEstimator, TorchEstimatorParamsWritable,
                  loader_num_epochs=None,
                  terminate_on_nan=False,
                  profiler=None,
-                 checkpoint_callback=None):
+                 debug_data_loader=False,
+                 train_async_data_loader_queue_size=None,
+                 val_async_data_loader_queue_size=None,
+                 use_gpu=True,
+                 mp_start_method=None):
 
         super(TorchEstimator, self).__init__()
         self._setDefault(loss_constructors=None,
                          input_shapes=None,
                          train_minibatch_fn=None,
                          transformation_fn=None,
-                         inmemory_cache_all=False,
                          num_gpus=None,
                          logger=None,
                          log_every_n_steps=50,
@@ -265,12 +290,15 @@ class TorchEstimator(HorovodEstimator, TorchEstimatorParamsWritable,
                          loader_num_epochs=None,
                          terminate_on_nan=False,
                          profiler=None,
-                         checkpoint_callback=None)
+                         trainer_args=None,
+                         debug_data_loader=False,
+                         train_async_data_loader_queue_size=None,
+                         val_async_data_loader_queue_size=None)
 
         kwargs = self._input_kwargs
 
         # pl version check
-        if LooseVersion(pl.__version__) < LooseVersion(MIN_PL_VERSION):
+        if version.parse(pl.__version__) < version.parse(MIN_PL_VERSION):
             raise RuntimeError("Only support pytorch_lightning version > {}, found version {}".format(MIN_PL_VERSION, pl.__version__))
 
         if EstimatorParams.loss.name in kwargs and TorchEstimator.loss_constructors.name in kwargs:
@@ -295,12 +323,6 @@ class TorchEstimator(HorovodEstimator, TorchEstimatorParamsWritable,
 
     def getLossConstructors(self):
         return self.getOrDefault(self.loss_constructors)
-
-    def setInMemoryCacheAll(self, value):
-        return self._set(inmemory_cache_all=value)
-
-    def getInMemoryCacheAll(self):
-        return self.getOrDefault(self.inmemory_cache_all)
 
     def setNumGPUs(self, value):
         return self._set(num_gpus=value)
@@ -338,17 +360,35 @@ class TorchEstimator(HorovodEstimator, TorchEstimatorParamsWritable,
     def getTerminateOnNan(self):
         return self.getOrDefault(self.terminate_on_nan)
 
-    def setCheckpointCallback(self, value):
-        return self._set(checkpoint_callback=value)
+    def setTrainerArgs(self, value):
+        return self._set(trainer_args=value)
 
-    def getCheckpointCallback(self):
-        return self.getOrDefault(self.checkpoint_callback)
+    def getTrainerArgs(self):
+        return self.getOrDefault(self.trainer_args)
 
     def getProfiler(self):
         return self.getOrDefault(self.profiler)
 
     def _get_optimizer(self):
         return self.getOrDefault(self.optimizer)
+
+    def setDebugDataLoader(self, value):
+        return self._set(debug_data_loader=value)
+
+    def getDebugDataLoader(self):
+        return self.getOrDefault(self.debug_data_loader)
+
+    def setTrainAsyncDataLoaderQueueSize(self, value):
+        return self._set(train_async_data_loader_queue_size=value)
+
+    def getTrainAsyncDataLoaderQueueSize(self):
+        return self.getOrDefault(self.train_async_data_loader_queue_size)
+
+    def setValAsyncDataLoaderQueueSize(self, value):
+        return self._set(val_async_data_loader_queue_size=value)
+
+    def getValAsyncDataLoaderQueueSize(self):
+        return self.getOrDefault(self.val_async_data_loader_queue_size)
 
     # Overwrites Model's getOptimizer method
     def getOptimizer(self):
@@ -429,6 +469,10 @@ class TorchEstimator(HorovodEstimator, TorchEstimatorParamsWritable,
     def _read_checkpoint(self, run_id):
         store = self.getStore()
         checkpoints = store.get_checkpoints(run_id, suffix='.ckpt')
+        
+        if not checkpoints:
+            return None
+        
         last_ckpt_path = checkpoints[-1]
 
         if self.getVerbose():
@@ -442,14 +486,13 @@ class TorchEstimator(HorovodEstimator, TorchEstimatorParamsWritable,
         best_checkpoint = torch.load(serialized_checkpoint, map_location=torch.device('cpu'))
 
         model = copy.deepcopy(self.getModel())
-        # optimizer = copy.deepcopy(self.getOptimizer())
-
         model.load_state_dict(best_checkpoint['model'])
-
         model.eval()
 
-        # optimizer.load_state_dict(best_checkpoint['optimizer'])
-        history = None
+        history = best_checkpoint['logged_metrics']
+
+        # Optimizer is part of the model no need to return it to transformer.
+        # TODO: (Pengz) Update the latest state of the optimizer in the model for retraining.
         optimizer = None
 
         return self.get_model_class()(**self._get_model_kwargs(

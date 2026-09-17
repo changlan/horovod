@@ -17,7 +17,9 @@ import horovod.spark.common._namedtuple_fix
 
 import contextlib
 import os
+import time
 
+from multiprocessing.pool import ThreadPool
 import pyarrow as pa
 import numpy as np
 import pyspark.sql.functions as f
@@ -29,6 +31,8 @@ try:
     from pyspark.sql.pandas.types import from_arrow_type
 except ImportError:
     from pyspark.sql.types import from_arrow_type
+
+from pyspark.sql import SparkSession
 
 from horovod.runner.common.util import codec, host_hash as hh
 from horovod.spark.common import cache, constants
@@ -539,6 +543,57 @@ def _train_val_split(df, validation):
     return train_df, val_df, validation_ratio
 
 
+_DATABRICKS_FILE_AVAILABILITY_WAIT_TIMEOUT_SECS = \
+    int(os.environ.get('DATABRICKS_FILE_AVAILABILITY_WAIT_TIMEOUT_SECS', '30'))
+
+
+_DATABRICKS_FILE_AVAILABILITY_CHECK_INTERVAL_SECS = \
+    float(os.environ.get('DATABRICKS_FILE_AVAILABILITY_CHECK_INTERVAL_SECS', '0.1'))
+
+
+def _wait_file_available_on_dbfs(store, url_list):
+    """
+    On databricks runtime, Waiting about DATABRICKS_FILE_AVAILABILITY_WAIT_TIMEOUT_SECS seconds
+    (default 30 seconds) to make sure all files are available for reading.
+    This is because Databricks filesystem backend storage such as S3 which only providing
+    eventually consistency.
+    """
+    # Import LocalStore here to avoid circular import
+    from horovod.spark.common.store import LocalStore
+    if isinstance(store, LocalStore):
+        return
+
+    if not is_databricks():
+        return
+
+    def wait_for_file(path):
+        end_time = time.time() + _DATABRICKS_FILE_AVAILABILITY_WAIT_TIMEOUT_SECS
+        while time.time() < end_time:
+            if store.exists(path):
+                return True
+            time.sleep(_DATABRICKS_FILE_AVAILABILITY_CHECK_INTERVAL_SECS)
+        return False
+
+    if len(url_list) == 0:
+        raise ValueError('Input url_list argument is empty.')
+
+    pool = ThreadPool(min(len(url_list), 64))
+    try:
+        results = pool.map(wait_for_file, url_list)
+        failed_list = [url for url, result in zip(url_list, results) if not result]
+        if failed_list:
+            raise TimeoutError('Timeout while waiting for all files to appear at urls {failed_list}.'
+                               .format(failed_list=','.join(failed_list)))
+    finally:
+        pool.close()
+        pool.join()
+
+
+def _get_spark_df_saved_file_list(saved_path):
+    spark_session = SparkSession.builder.getOrCreate()
+    return list(spark_session.read.parquet(saved_path)._jdf.inputFiles())
+
+
 def _get_or_create_dataset(key, store, df, feature_columns, label_columns,
                            validation, sample_weight_col, compress_sparse,
                            num_partitions, num_processes, verbose):
@@ -590,6 +645,8 @@ def _get_or_create_dataset(key, store, df, feature_columns, label_columns,
                 .mode('overwrite') \
                 .parquet(train_data_path)
 
+            saved_file_list = _get_spark_df_saved_file_list(train_data_path)
+
             if val_df:
                 val_partitions = max(int(num_partitions * validation_ratio),
                                      num_processes)
@@ -601,6 +658,16 @@ def _get_or_create_dataset(key, store, df, feature_columns, label_columns,
                     .write \
                     .mode('overwrite') \
                     .parquet(val_data_path)
+
+                saved_file_list += _get_spark_df_saved_file_list(val_data_path)
+
+            try:
+                _wait_file_available_on_dbfs(store, saved_file_list)
+            except TimeoutError as e:
+                err_msg = 'Timeout while waiting for all parquet-store files to appear, Please ' \
+                          'check whether these files were saved successfully when materializing ' \
+                          'dataframe. Internal Error: {e}'.format(e=str(e))
+                raise RuntimeError(err_msg)
 
             train_rows, val_rows, pq_metadata, avg_row_size = get_simple_meta_from_parquet(
                 store, label_columns, feature_columns, sample_weight_col, dataset_idx)
@@ -696,15 +763,16 @@ def to_list(var, length):
     return var
 
 
-def _get_assigned_gpu_or_default(default):
+def _get_assigned_gpu_or_local_rank(local_rank):
     from horovod.spark.task import get_available_devices
     available_devices = get_available_devices()
-    if available_devices:
+    if available_devices and os.getenv('HOROVOD_SPARK_USE_LOCAL_RANK_GPU_INDEX', '0') == '0':
         # if GPU-aware scheduling is available, pin to the assigned GPU index
+        # this is always the first GPU index in available_devices as only one GPU is expected to be assigned
         return int(available_devices[0])
     else:
-        # pin to default GPU index (local rank)
-        return default
+        # pin to local rank GPU index
+        return local_rank
 
 
 def is_databricks():
@@ -744,3 +812,13 @@ def get_spark_df_output_schema(input_df_schema, label_cols, output_cols, metadat
     output_schema = StructType(output_fields)
 
     return output_schema
+
+def _set_mp_start_method(method, verbose):
+    import multiprocessing as mp
+    supported_values = mp.get_all_start_methods()
+    if method not in supported_values:
+        raise ValueError(f"Multiprocessing start method {method} is not supported on this system. "
+                         f"Supported values are : {supported_values}")
+    mp.set_start_method(method)
+    if verbose:
+        print(f'Multiprocessing start method has been set to {mp.get_start_method()}')

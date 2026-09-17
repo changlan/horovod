@@ -13,8 +13,25 @@
 # limitations under the License.
 # ==============================================================================
 
+import argparse
 import tensorflow as tf
 import horovod.tensorflow.keras as hvd
+from packaging import version
+
+parser = argparse.ArgumentParser(description='Tensorflow 2.0 Keras MNIST Example')
+
+parser.add_argument('--use-mixed-precision', action='store_true', default=False,
+                    help='use mixed precision for training')
+
+args = parser.parse_args()
+
+if args.use_mixed_precision:
+    if version.parse(tf.__version__) >= version.parse('2.4.0'):
+        from tensorflow.keras import mixed_precision
+        mixed_precision.set_global_policy('mixed_float16')
+    else:
+        policy = tf.keras.mixed_precision.experimental.Policy('mixed_float16')
+        tf.keras.mixed_precision.experimental.set_policy(policy)
 
 # Horovod: initialize Horovod.
 hvd.init()

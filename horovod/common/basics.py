@@ -36,6 +36,9 @@ class HorovodBasics(object):
         self.Average = self.MPI_LIB_CTYPES.horovod_reduce_op_average()
         self.Sum = self.MPI_LIB_CTYPES.horovod_reduce_op_sum()
         self.Adasum = self.MPI_LIB_CTYPES.horovod_reduce_op_adasum()
+        self.Min = self.MPI_LIB_CTYPES.horovod_reduce_op_min()
+        self.Max = self.MPI_LIB_CTYPES.horovod_reduce_op_max()
+        self.Product = self.MPI_LIB_CTYPES.horovod_reduce_op_product()
 
         # These must be kept in sync with operations.cc (this might also be possible via ctypes)
         self.HOROVOD_PROCESS_SET_ERROR_INIT = -1
@@ -150,7 +153,8 @@ class HorovodBasics(object):
 
     def is_initialized(self):
         """Returns True if Horovod is initialized"""
-        return self.MPI_LIB_CTYPES.horovod_is_initialized()
+        is_initialized = self.MPI_LIB_CTYPES.horovod_is_initialized()
+        return bool(is_initialized)
 
     def start_timeline(self, file_path, mark_cycles=False):
         """Creates a timeline file at `file_path` and begins recording.
@@ -485,3 +489,4 @@ class HorovodBasics(object):
         elif result == self.HOROVOD_PROCESS_SET_ERROR_UNKNOWN_SET:
             raise ValueError('MPI communicator does not correspond to any registered process set.')
         return result
+

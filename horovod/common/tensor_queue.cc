@@ -38,7 +38,7 @@ Status TensorQueue::AddToTensorQueueMulti(std::vector<TensorTableEntry>& entries
                                           std::vector<Request>& messages) {
   std::lock_guard<std::mutex> guard(mutex_);
 
-  for (int i = 0; i < entries.size(); ++i) {
+  for (std::size_t i = 0; i < entries.size(); ++i) {
     if (tensor_table_.find(entries[i].tensor_name) != tensor_table_.end()) {
       return DUPLICATE_NAME_ERROR;
     }
@@ -108,18 +108,20 @@ void TensorQueue::GetTensorEntriesFromResponse(
              response.response_type() == Response::ALLGATHER ||
              response.response_type() == Response::BROADCAST ||
              response.response_type() == Response::ALLTOALL ||
+             response.response_type() == Response::REDUCESCATTER ||
              response.response_type() == Response::ADASUM ||
+             response.response_type() == Response::BARRIER ||
              response.response_type() == Response::ERROR);
 
       if (!joined) {
         // We should never fail at finding this key in the tensor table.
         auto iter = tensor_table_.find(name);
         assert(iter != tensor_table_.end());
-
         entries.push_back(std::move(iter->second));
 
         // Clear the tensor table of this tensor.
         tensor_table_.erase(iter);
+
       } else if (response.response_type() != Response::ERROR) {
 
         // Find Join tensor to use its context.
@@ -150,6 +152,12 @@ TensorQueue::GetTensorEntry(const std::string& tensor_name) const{
   auto& iter = tensor_table_.at(tensor_name);
 
   return iter;
+}
+
+bool TensorQueue::IsTensorPresentInTable(const std::string& tensor_name) const {
+  // Lock on the tensor table.
+  std::lock_guard<std::mutex> guard(mutex_);
+  return tensor_table_.find(tensor_name) != tensor_table_.end();
 }
 
 // Pop out all the messages from the queue

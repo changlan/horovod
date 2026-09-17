@@ -33,6 +33,9 @@ using namespace horovod::common;
 
 typedef ::mxnet::NDArray NDArray;
 typedef ::mxnet::Engine::CallbackOnComplete CallbackOnComplete;
+#if MXNET_MAJOR >= 2 || MXNET_ASYNC_GPU_ENGINE_SUPPORTED
+typedef ::mxnet::Engine::CallbackOnStart CallbackOnStart;
+#endif
 typedef Request::RequestType OperationType;
 typedef std::shared_ptr<MXTensor> MXTensorSharedPtr;
 typedef std::shared_ptr<NDArray> NDArraySharedPtr;
@@ -48,7 +51,7 @@ struct MpiOpsParam {
   int root_rank;
   NDArraySharedPtr splits_tensor;
   NDArraySharedPtr received_splits_tensor;
-  bool average;
+  ReduceOp reduce_op;
   double prescale_factor;
   double postscale_factor;
   int process_set_id;
@@ -61,7 +64,7 @@ struct MpiOpsParam {
               const std::vector<NDArraySharedPtr>& cpu_output_tensors,
               const OperationType& op_type,
               std::vector<std::string>&& op_names,
-              int root_rank, bool average,
+              int root_rank, ReduceOp reduce_op,
               NDArraySharedPtr splits_tensor,
               NDArraySharedPtr received_splits_tensor,
               double prescale_factor,
@@ -77,7 +80,7 @@ struct MpiOpsParam {
         root_rank(root_rank),
         splits_tensor(splits_tensor),
         received_splits_tensor(received_splits_tensor),
-        average(average),
+        reduce_op(reduce_op),
         prescale_factor(prescale_factor),
         postscale_factor(postscale_factor),
         process_set_id(process_set_id) {
@@ -91,7 +94,7 @@ inline MpiOpsParam* CreateMpiOpsParam(std::vector<NDArraySharedPtr>&& input_tens
                                       const std::vector<NDArraySharedPtr>& cpu_output_tensors,
                                       const OperationType& op_type,
                                       std::vector<std::string>&& op_names,
-                                      int root_rank, bool average,
+                                      int root_rank, ReduceOp reduce_op,
                                       NDArraySharedPtr splits_tensor,
                                       NDArraySharedPtr received_splits_tensor,
                                       double prescale_factor,
@@ -100,7 +103,7 @@ inline MpiOpsParam* CreateMpiOpsParam(std::vector<NDArraySharedPtr>&& input_tens
   return new MpiOpsParam(
       std::move(input_tensors), std::move(output_tensors), std::move(outputs),
       cpu_input_tensors, cpu_output_tensors, op_type, std::move(op_names),
-      root_rank, average, splits_tensor, received_splits_tensor,
+      root_rank, reduce_op, splits_tensor, received_splits_tensor,
       prescale_factor, postscale_factor, process_set_id);
 }
 
@@ -109,18 +112,16 @@ void DeleteMpiOpsParam(void* param) {
   delete ops_param;
 }
 
-extern "C" int horovod_mxnet_allreduce_async(NDArray* const * inputs,
-                                             NDArray* const * outputs,
-                                             const char* name, bool average,
-                                             int priority,
-                                             double prescale_factor,
-                                             double postscale_factor,
-                                             int num_tensors,
-                                             int process_set_id);
-extern "C" int horovod_mxnet_allgather_async(NDArray* input,
-                                             NDArray* output,
+extern "C" int
+horovod_mxnet_allreduce_async(NDArray* const* inputs, NDArray* const* outputs,
+                              const char* name, int reduce_op_int, int priority,
+                              double prescale_factor, double postscale_factor,
+                              int num_tensors, int process_set_id);
+extern "C" int horovod_mxnet_allgather_async(NDArray* const* inputs,
+                                             NDArray* const* outputs,
                                              const char* name, int priority,
-                                             int process_set_id);
+                                             int process_set_id,
+                                             int num_tensors);
 extern "C" int horovod_mxnet_broadcast_async(NDArray* input,
                                              NDArray* output,
                                              const char* name, int root_rank,
@@ -133,6 +134,10 @@ extern "C" int horovod_mxnet_alltoall_async(NDArray* input,
                                             NDArray* output_received_splits,
                                             int priority,
                                             int process_set_id);
+extern "C" int horovod_mxnet_reducescatter_async(
+    NDArray* const* inputs, NDArray* const* outputs, const char* name,
+    int priority, int process_set_id, int num_tensors, int reduce_op_int,
+    double prescale_factor, double postscale_factor);
 
 } // namespace mxnet
 } // namespace horovod

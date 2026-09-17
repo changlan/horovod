@@ -57,7 +57,6 @@ else:
 _basics = _HorovodBasics(__file__, 'mpi_lib')
 
 # import basic methods
-init = _basics.init
 shutdown = _basics.shutdown
 is_initialized = _basics.is_initialized
 start_timeline = _basics.start_timeline
@@ -83,6 +82,14 @@ rocm_built = _basics.rocm_built
 Average = _basics.Average
 Sum = _basics.Sum
 Adasum = _basics.Adasum
+Min = _basics.Min
+Max = _basics.Max
+Product = _basics.Product
+
+def init(*args, **kwargs):
+    _basics.init(*args, **kwargs)
+    # Call set up again to make sure the basics is in sync
+    _setup_process_sets(_basics)
 
 is_homogeneous = _basics.is_homogeneous
 
@@ -153,10 +160,6 @@ def _grouped_allreduce(tensors, name=None, op=Sum, prescale_factor=1.0, postscal
                        ignore_name_scope=False, process_set=global_process_set):
     """An op which reduces input tensors over all the Horovod processes. The
     default reduction is a sum.
-
-    The reduction operation is keyed by the name of the op. The tensor type and
-    shape must be the same on all Horovod processes for a given name. The reduction
-    will not start until all processes are ready to send and receive the tensor.
 
     The reduction operations are keyed by the name of the op. Reductions are
     performed across tensors in the same list position. The tensor type and
@@ -253,6 +256,65 @@ def _allgather_grad(op, grad):
     return splits[temp_process_set_object.rank()]
 
 
+def grouped_allgather(tensors, name=None, ignore_name_scope=False, process_set=global_process_set):
+    """An op which concatenates the input tensor with the same input tensor on
+    all other Horovod processes.
+
+    The concatenation is done on the first dimension, so the input tensors on the
+    different processes must have the same rank and shape, except for the first
+    dimension, which is allowed to be different.
+
+    Returns:
+      A list of tensors of the same rank and type as `tensor`, concatenated on
+      dimension zero across all processes. For each returned tensor the shape
+      is identical to the input shape, except for the first dimension, which
+      may be greater and is the sum of all first dimensions of the tensors
+      in different Horovod processes.
+    """
+    if name is None and not _executing_eagerly():
+        name = _normalize_name('HorovodGroupedAllgather_%s_%s' % (tensors[0].name, tensors[-1].name))
+    return MPI_LIB.horovod_grouped_allgather(tensors, name=name,
+                                             ignore_name_scope=ignore_name_scope,
+                                             process_set_id=process_set.process_set_id)
+
+
+@ops.RegisterGradient('HorovodGroupedAllgather')
+def _grouped_allgather_grad(op, *grads):
+    """Gradient for the grouped allgather op.
+
+    Args:
+      op: An operation.
+      grad: List of `Tensor` gradients with respect to the outputs of the op.
+
+    Returns:
+      The gradients with respect to the inputs of the op.
+    """
+    ignore_name_scope = op.get_attr('ignore_name_scope')
+    process_set_id = op.get_attr('process_set_id')
+    temp_process_set_object = _temp_process_set_object(process_set_id)
+    # Not using _grouped_allreduce here because all its input tensors need to be of the same dtype, but TensorFlow may
+    # give us float32 zero gradients here despite non-zero gradients being, e.g, float64.
+    grads = [_allreduce(g, op=Average, ignore_name_scope=ignore_name_scope, process_set=temp_process_set_object)
+             for g in grads]
+
+    split_sizes = []
+    with tf.device('/cpu:0'):
+        # Keep the split size tensors on CPU.
+        for x in op.inputs:
+            d = tf.shape(x)
+            d = tf.reshape(d[0], [1])
+
+            s = temp_process_set_object.size()
+            d = tf.reshape(
+                allgather(d, ignore_name_scope=ignore_name_scope, process_set=temp_process_set_object),
+                [s])
+            split_sizes.append(d)
+
+    splits_list = [tf.split(grad, num_or_size_splits=d, axis=0)
+                   for grad, d in zip(grads, split_sizes)]
+    return [splits[temp_process_set_object.rank()] for splits in splits_list]
+
+
 def broadcast(tensor, root_rank, name=None, ignore_name_scope=False, process_set=global_process_set):
     """An op which broadcasts the input tensor on root rank to the same input tensor
     on all other Horovod processes.
@@ -292,6 +354,43 @@ def _broadcast_grad(op, grad):
     if rank() != root_rank:
         return grad_reduced * 0
     return grad_reduced
+
+
+def broadcast_(variables, root_rank, name=None, process_set=global_process_set):
+    """An op which broadcasts the input variables from the root rank to the same
+    input variables on all other Horovod processes. The operation is performed
+    in-place.
+
+    The broadcast operation is keyed by the name of the op combined with the names
+    of the variables. The variable type and shape must be the same on all Horovod
+    processes for any given name. The broadcast will not start until all processes
+    are ready to send and receive all variables. In each process all variables need
+    to be located on the same device (CPU or GPU).
+
+    Note: This is only supported with TensorFlow 2.6 or later.
+
+    Returns:
+      The tensor values of the updated `variables` as broadcasted from root rank.
+    """
+    from packaging import version
+    if version.parse(tf.__version__) < version.parse('2.6.0'):
+        raise NotImplementedError("In-place broadcasts are only supported with TensorFlow 2.6 or later")
+
+    from tensorflow.python.ops import resource_variable_ops
+    if all(resource_variable_ops.is_resource_variable(var) for var in variables):
+        with tf.control_dependencies(
+            [MPI_LIB.horovod_broadcast_inplace_resource([var.handle for var in variables],
+                                                        variable_names=[var.name for var in variables],
+                                                        name=name,
+                                                        root_rank=root_rank,
+                                                        process_set_id=process_set.process_set_id)]):
+            return [var.read_value() for var in variables]
+    elif all(not resource_variable_ops.is_resource_variable(var) for var in variables):
+        return MPI_LIB.horovod_broadcast_inplace(variables, variable_names=[var.name for var in variables],
+                                                 name=name, root_rank=root_rank,
+                                                 process_set_id=process_set.process_set_id)
+    else:
+        raise ValueError("All variables passed to broadcast_() should be of the same kind, resource or reference")
 
 
 def alltoall(tensor, splits=None, name=None, ignore_name_scope=False, process_set=global_process_set):
@@ -353,6 +452,114 @@ def _alltoall_grad(op, grad_wrt_output, grad_wrt_received_splits):
     grad_wrt_splits = None # not differentiable (integer variable)
 
     return [grad_wrt_tensor, grad_wrt_splits]
+
+
+def _reducescatter(tensor, name=None, op=Sum, ignore_name_scope=False,
+                   process_set=global_process_set, prescale_factor=1.0,
+                   postscale_factor=1.0):
+    """An op which reduces an input tensor over all the Horovod processes, then
+    scatters the result across all the Horovod processes. The default reduction
+    is a sum.
+
+    The reduction operation is keyed by the name of the op. The tensor type and
+    shape must be the same on all Horovod processes for a given name. The reduction
+    will not start until all processes are ready to send and receive the tensor.
+
+    Returns:
+      A tensor of the same rank and type as `tensor`. The shape is identical to the
+        input shape, except for the first dimension, which will be divided across
+        the different Horovod processes.
+    """
+    if name is None and not _executing_eagerly():
+        name = 'HorovodReducescatter_%s' % _normalize_name(tensor.name)
+    return MPI_LIB.horovod_reducescatter(tensor, name=name, reduce_op=op,
+                                         ignore_name_scope=ignore_name_scope,
+                                         process_set_id=process_set.process_set_id,
+                                         prescale_factor=prescale_factor,
+                                         postscale_factor=postscale_factor)
+
+
+@ops.RegisterGradient('HorovodReducescatter')
+def _reducescatter_grad(op, grad):
+    """Gradient for reducescatter op.
+
+    Args:
+      op: An operation.
+      grad: `Tensor` gradient with respect to the output of the op.
+
+    Returns:
+      The gradient with respect to the input of the op.
+    """
+    ignore_name_scope = op.get_attr('ignore_name_scope')
+    process_set_id = op.get_attr('process_set_id')
+    reduce_op = op.get_attr('reduce_op')
+    prescale_factor = op.get_attr('prescale_factor')
+    postscale_factor = op.get_attr('postscale_factor')
+    process_set = _temp_process_set_object(process_set_id)
+    if reduce_op == Sum:
+        grad *= process_set.size()
+    if prescale_factor != 1.0:
+        grad *= prescale_factor
+    if postscale_factor != 1.0:
+        grad *= postscale_factor
+    return allgather(grad, ignore_name_scope=ignore_name_scope,
+                     process_set=process_set)
+
+
+def _grouped_reducescatter(tensors, name=None, op=Sum, ignore_name_scope=False,
+                           process_set=global_process_set,
+                           prescale_factor=1.0, postscale_factor=1.0):
+    """An op which sums an input tensor over all the Horovod processes, then
+    scatters the result across all the Horovod processes.
+
+    The reduction operations are keyed by the name of the op. Reductions are
+    performed across tensors in the same list position. The tensor type and
+    shape must be the same on all Horovod processes for tensors sharing
+    positions in the input tensor list. The reduction will not start until all
+    processes are ready to send and receive the tensors.
+
+    Returns:
+      A list of tensors of the same rank and type as those in `tensors`.
+      For each returned tensor the shape is identical to the corresponding
+      input shape, except for the first dimension, which will be divided across
+      the different Horovod processes.
+    """
+    if name is None and not _executing_eagerly():
+        name = _normalize_name('HorovodGroupedReducescatter_%s_%s' % (tensors[0].name, tensors[-1].name))
+    return MPI_LIB.horovod_grouped_reducescatter(tensors, name=name, reduce_op=op,
+                                                 ignore_name_scope=ignore_name_scope,
+                                                 process_set_id=process_set.process_set_id,
+                                                 prescale_factor=prescale_factor,
+                                                 postscale_factor=postscale_factor)
+
+
+@ops.RegisterGradient('HorovodGroupedReducescatter')
+def _grouped_reducescatter_grad(op, *grads):
+    """Gradient for the grouped reducescatter op.
+
+    Args:
+      op: An operation.
+      grads: List of `Tensor` gradients with respect to the outputs of the op.
+
+    Returns:
+      The gradients with respect to the inputs of the op.
+    """
+    ignore_name_scope = op.get_attr('ignore_name_scope')
+    process_set_id = op.get_attr('process_set_id')
+    reduce_op = op.get_attr('reduce_op')
+    prescale_factor = op.get_attr('prescale_factor')
+    postscale_factor = op.get_attr('postscale_factor')
+    process_set = _temp_process_set_object(process_set_id)
+    if reduce_op == Sum:
+        grads = [grad * process_set.size() for grad in grads]
+    if prescale_factor != 1.0:
+        grads = [grad * prescale_factor for grad in grads]
+    if postscale_factor != 1.0:
+        grads = [grad * postscale_factor for grad in grads]
+    # Not using grouped_allgather here because all its input tensors need to be of the same dtype, but TensorFlow may
+    # give us float32 zero gradients here despite non-zero gradients being, e.g, float64.
+    return [allgather(g, ignore_name_scope=ignore_name_scope, process_set=process_set) for g in grads]
+
 
 def join():
     """An op to indicate that the rank finished processing data.
@@ -446,7 +653,7 @@ def local_rank_op(name=None):
     Returns:
       An integer scalar with the local Horovod rank of the calling process.
     """
-    return MPI_LIB.horovod_rank(name=name)
+    return MPI_LIB.horovod_local_rank(name=name)
 
 
 ops.NotDifferentiable('HorovodLocalRank')

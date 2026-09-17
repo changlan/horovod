@@ -37,19 +37,19 @@
 #include "hashes.h"
 #include "logging.h"
 #include "message.h"
+#include "nvtx_op_range.h"
 #include "ops/operation_manager.h"
 #include "parameter_manager.h"
 #include "timeline.h"
 #include "utils/env_parser.h"
-#include "nvtx_op_range.h"
 
 #if HAVE_MPI
 #define OMPI_SKIP_MPICXX
 #include "mpi.h"
 #include "mpi/mpi_context.h"
 #include "mpi/mpi_controller.h"
-#include "ops/mpi_operations.h"
 #include "ops/adasum_mpi_operations.h"
+#include "ops/mpi_operations.h"
 #endif
 
 #if HAVE_GPU
@@ -129,6 +129,8 @@ GPUContext gpu_context;
 
 #if HAVE_NCCL
 NCCLContext nccl_context;
+NCCLContext local_nccl_context;
+NCCLContext cross_nccl_context;
 #endif
 
 #if HAVE_DDL
@@ -148,6 +150,7 @@ OperationManager* CreateOperationManager(HorovodGlobalState& state) {
   std::vector<std::shared_ptr<AllreduceOp>> allreduce_ops;
   std::vector<std::shared_ptr<AllgatherOp>> allgather_ops;
   std::vector<std::shared_ptr<BroadcastOp>> broadcast_ops;
+  std::vector<std::shared_ptr<ReducescatterOp>> reducescatter_ops;
   std::vector<std::shared_ptr<AllreduceOp>> adasum_ops;
   std::vector<std::shared_ptr<AlltoallOp>> alltoall_ops;
 
@@ -158,11 +161,11 @@ OperationManager* CreateOperationManager(HorovodGlobalState& state) {
         new MPI_GPUAllreduce(&gpu_context, &state)));
 
 #elif HAVE_NCCL && HOROVOD_GPU_ALLREDUCE == 'N'
-    adasum_ops.push_back(std::shared_ptr<AllreduceOp>(new AdasumGpuAllreduceOp(&global_mpi_context, &nccl_context, &gpu_context, &state)));
+    adasum_ops.push_back(std::shared_ptr<AllreduceOp>(new AdasumGpuAllreduceOp(
+        &global_mpi_context, &nccl_context, &gpu_context, &state)));
 
-    allreduce_ops.push_back(
-        std::shared_ptr<AllreduceOp>(new NCCLHierarchicalAllreduce(
-            &nccl_context, &gpu_context, &state)));
+    allreduce_ops.push_back(std::shared_ptr<AllreduceOp>(
+        new NCCLHierarchicalAllreduce(&nccl_context, &gpu_context, &state)));
 
 #elif HAVE_DDL && HOROVOD_GPU_ALLREDUCE == 'D'
     allreduce_ops.push_back(std::shared_ptr<AllreduceOp>(
@@ -173,29 +176,41 @@ OperationManager* CreateOperationManager(HorovodGlobalState& state) {
     allgather_ops.push_back(std::shared_ptr<AllgatherOp>(
         new MPI_GPUAllgather(&gpu_context, &state)));
 #endif
-    allgather_ops.push_back(std::shared_ptr<AllgatherOp>(
-        new MPIHierarchicalAllgather(&state)));
+    allgather_ops.push_back(
+        std::shared_ptr<AllgatherOp>(new MPIHierarchicalAllgather(&state)));
 
 #if HOROVOD_GPU_ALLTOALL == 'M'
-    alltoall_ops.push_back(std::shared_ptr<AlltoallOp>(
-        new MPI_GPUAlltoall(&gpu_context, &state)));
+    alltoall_ops.push_back(
+        std::shared_ptr<AlltoallOp>(new MPI_GPUAlltoall(&gpu_context, &state)));
+#endif
+
+#if HOROVOD_GPU_REDUCESCATTER == 'M'
+    reducescatter_ops.push_back(std::shared_ptr<ReducescatterOp>(
+        new MPI_GPUReducescatter(&gpu_context, &state)));
 #endif
   }
 #endif
 
 #if HAVE_NCCL && HOROVOD_GPU_ALLREDUCE == 'N'
   allreduce_ops.push_back(std::shared_ptr<AllreduceOp>(
+    new NCCLTorusAllreduce(&local_nccl_context, &cross_nccl_context, &gpu_context, &state)));
+  allreduce_ops.push_back(std::shared_ptr<AllreduceOp>(
       new NCCLAllreduce(&nccl_context, &gpu_context, &state)));
 #endif
 
 #if HAVE_NCCL && HOROVOD_GPU_BROADCAST == 'N'
-    broadcast_ops.push_back(
-        std::shared_ptr<BroadcastOp>(new NCCLBroadcast(&nccl_context, &gpu_context, &state)));
+  broadcast_ops.push_back(std::shared_ptr<BroadcastOp>(
+      new NCCLBroadcast(&nccl_context, &gpu_context, &state)));
 #endif
 
 #if HAVE_NCCL && HOROVOD_GPU_ALLGATHER == 'N'
   allgather_ops.push_back(std::shared_ptr<AllgatherOp>(
       new NCCLAllgather(&nccl_context, &gpu_context, &state)));
+#endif
+
+#if HAVE_NCCL && HOROVOD_GPU_REDUCESCATTER == 'N'
+    reducescatter_ops.push_back(std::shared_ptr<ReducescatterOp>(
+        new NCCLReducescatter(&nccl_context, &gpu_context, &state)));
 #endif
 
 #if HAVE_NCCL && HOROVOD_GPU_ALLTOALL == 'N'
@@ -213,6 +228,8 @@ OperationManager* CreateOperationManager(HorovodGlobalState& state) {
         std::shared_ptr<BroadcastOp>(new GlooBroadcast(&state)));
     alltoall_ops.push_back(
         std::shared_ptr<AlltoallOp>(new GlooAlltoall(&state)));
+    reducescatter_ops.push_back(
+        std::shared_ptr<ReducescatterOp>(new GlooReducescatter(&state)));
   }
 #endif
 
@@ -224,15 +241,14 @@ OperationManager* CreateOperationManager(HorovodGlobalState& state) {
         std::make_shared<CCLAllgather>(&ccl_context, &state));
     broadcast_ops.push_back(
         std::make_shared<CCLBroadcast>(&ccl_context, &state));
-    alltoall_ops.push_back(
-        std::make_shared<CCLAlltoall>(&ccl_context, &state));
+    alltoall_ops.push_back(std::make_shared<CCLAlltoall>(&ccl_context, &state));
   }
 #endif
 
 #if HAVE_MPI
-  if (global_mpi_context.IsEnabled()){
-    adasum_ops.push_back(
-        std::shared_ptr<AllreduceOp>(new AdasumMPIAllreduceOp(&global_mpi_context, &state)));
+  if (global_mpi_context.IsEnabled()) {
+    adasum_ops.push_back(std::shared_ptr<AllreduceOp>(
+        new AdasumMPIAllreduceOp(&global_mpi_context, &state)));
     allreduce_ops.push_back(
         std::shared_ptr<AllreduceOp>(new MPIAllreduce(&state)));
     allgather_ops.push_back(
@@ -241,15 +257,19 @@ OperationManager* CreateOperationManager(HorovodGlobalState& state) {
         std::shared_ptr<BroadcastOp>(new MPIBroadcast(&state)));
     alltoall_ops.push_back(
         std::shared_ptr<AlltoallOp>(new MPIAlltoall(&state)));
+    reducescatter_ops.push_back(
+        std::shared_ptr<ReducescatterOp>(new MPIReducescatter(&state)));
   }
 #endif
 
   std::shared_ptr<JoinOp> join_op(new JoinOp(&state));
+  std::shared_ptr<BarrierOp> barrier_op(new BarrierOp(&state));
   std::shared_ptr<ErrorOp> error_op(new ErrorOp(&state));
 
   return new OperationManager(&state.parameter_manager, allreduce_ops,
                               allgather_ops, broadcast_ops, alltoall_ops,
-                              join_op, adasum_ops, error_op);
+                              reducescatter_ops, join_op, adasum_ops,
+                              barrier_op, error_op);
 }
 
 // Process a Response by doing a reduction, a gather, a broadcast, or
@@ -259,12 +279,18 @@ void PerformOperation(Response response, ProcessSet& process_set) {
   auto& timeline = horovod_global.timeline;
   process_set.tensor_queue.GetTensorEntriesFromResponse(response, entries,
                                                         process_set.joined);
-  if (response.response_type() != Response::JOIN) {
+
+  if (response.response_type() != Response::JOIN &&
+      response.response_type() != Response::BARRIER) {
     for (auto& e : entries) {
       timeline.Start(e.tensor_name, response.response_type(), e.tensor->size());
     }
 
-    if (entries.size() > 1) {
+    if (entries.size() > 1 ||
+        (response.response_type() == Response::REDUCESCATTER &&
+         response.prescale_factor() != 1.0)) {
+      // For Reducescatter with prescaling we use the fusion buffer even for
+      // unfused operations. This avoids an extra temporary allocation.
       auto first_entry = entries[0];
       // Note: it is OK for different entries to come from different frameworks
       // since buffer allocated here is guaranteed to survive at least till the
@@ -276,7 +302,8 @@ void PerformOperation(Response response, ProcessSet& process_set) {
           [&]() { timeline.ActivityStartAll(entries, INIT_FUSION_BUFFER); },
           [&]() { timeline.ActivityEndAll(entries); });
       if (!status.ok()) {
-        LOG(DEBUG, horovod_global.global_controller->GetRank()) << "InitializeBuffer Failed";
+        LOG(DEBUG, horovod_global.global_controller->GetRank())
+            << "InitializeBuffer Failed";
         for (auto& e : entries) {
           timeline.End(e.tensor_name, nullptr);
           e.FinishWithCallback(status);
@@ -289,10 +316,12 @@ void PerformOperation(Response response, ProcessSet& process_set) {
   Status status;
   try {
     // process_set is passed here only for the case of Response::JOIN where
-    // entries is empty. The other operations can infer process_set from entries.
+    // entries is empty. The other operations can infer process_set from
+    // entries.
     status = op_manager->ExecuteOperation(entries, response, process_set);
   } catch (const std::exception& ex) {
-    LOG(DEBUG, horovod_global.global_controller->GetRank()) << "ExecuteOperation Failed";
+    LOG(DEBUG, horovod_global.global_controller->GetRank())
+        << "ExecuteOperation Failed";
     status = Status::UnknownError(ex.what());
   }
 
@@ -428,12 +457,12 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
   int local_rank = state.global_controller->GetLocalRank();
 
   // Set background thread affinity
-  parse_and_set_affinity(std::getenv(HOROVOD_THREAD_AFFINITY), local_size, local_rank);
+  parse_and_set_affinity(std::getenv(HOROVOD_THREAD_AFFINITY), local_size,
+                         local_rank);
 
 #if HAVE_GPU
   // Set number of GPU streams to use
-  auto horovod_num_nccl_streams =
-      std::getenv(HOROVOD_NUM_NCCL_STREAMS);
+  auto horovod_num_nccl_streams = std::getenv(HOROVOD_NUM_NCCL_STREAMS);
   if (horovod_num_nccl_streams != nullptr &&
       std::stol(horovod_num_nccl_streams, nullptr, 10) > 0) {
     state.num_nccl_streams = std::atoi(horovod_num_nccl_streams);
@@ -441,6 +470,11 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
 
 #if HAVE_NCCL
   nccl_context.nccl_comms.resize(state.num_nccl_streams);
+  local_nccl_context.nccl_comms.resize(state.num_nccl_streams);
+  cross_nccl_context.nccl_comms.resize(state.num_nccl_streams);
+  SetBoolFromEnv(HOROVOD_ELASTIC, nccl_context.elastic, true);
+  SetBoolFromEnv(HOROVOD_ELASTIC, local_nccl_context.elastic, true);
+  SetBoolFromEnv(HOROVOD_ELASTIC, cross_nccl_context.elastic, true);
 #endif
   gpu_context.streams.resize(state.num_nccl_streams);
 
@@ -465,8 +499,7 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
         state.timeline.Initialize(horovod_timeline,
                                   static_cast<unsigned int>(size));
       } else {
-        state.timeline.Initialize("",
-                                  static_cast<unsigned int>(size));
+        state.timeline.Initialize("", static_cast<unsigned int>(size));
       }
     }
     should_enable_timeline = true;
@@ -478,8 +511,7 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
   ParseStallInspectorFromEnv(
       state.process_set_table.Get(0).controller->GetStallInspector());
   bool mark_cycles = false;
-  SetBoolFromEnv(HOROVOD_TIMELINE_MARK_CYCLES, mark_cycles,
-                 true);
+  SetBoolFromEnv(HOROVOD_TIMELINE_MARK_CYCLES, mark_cycles, true);
   state.timeline_controller.SetMarkCyclesInTimelinePending(mark_cycles);
   state.mark_cycles_in_timeline = mark_cycles;
 
@@ -557,19 +589,35 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
            "allgather and hierarchical allreduce.";
   }
 
+  // Set flag for torus allreduce. Ignore if Horovod is running on a
+  // single node.
+  auto horovod_torus_allreduce =
+      std::getenv(HOROVOD_TORUS_ALLREDUCE);
+  state.parameter_manager.SetTorusAllreduce(false);
+  if (horovod_torus_allreduce != nullptr) {
+    bool value = std::strtol(horovod_torus_allreduce, nullptr, 10) > 0 &&
+                 (size != local_size);
+    state.parameter_manager.SetTorusAllreduce(value, true);
+  }
+#if HOROVOD_GPU_ALLREDUCE != 'N' && HOROVOD_GPU_ALLREDUCE != 'D'
+  // Torus allreduce is not supported without NCCL or DDL
+  state.parameter_manager.SetTorusAllreduce(false, true);
+#endif
+
   // Set flag to control use of batched memcopy kernel on GPU
-  auto horovod_batch_d2d_memcopies =
-      std::getenv(HOROVOD_BATCH_D2D_MEMCOPIES);
+  auto horovod_batch_d2d_memcopies = std::getenv(HOROVOD_BATCH_D2D_MEMCOPIES);
   if (horovod_batch_d2d_memcopies != nullptr &&
       std::strtol(horovod_batch_d2d_memcopies, nullptr, 10) == 0) {
     state.batch_d2d_memcopies = false;
   }
 
   // Check if group fusion should be disabled
-  SetBoolFromEnv(HOROVOD_DISABLE_GROUP_FUSION, state.disable_group_fusion, true);
+  SetBoolFromEnv(HOROVOD_DISABLE_GROUP_FUSION, state.disable_group_fusion,
+                 true);
 
   // Check if async completion should be enabled
-  SetBoolFromEnv(HOROVOD_ENABLE_ASYNC_COMPLETION, state.enable_async_completion, true);
+  SetBoolFromEnv(HOROVOD_ENABLE_ASYNC_COMPLETION, state.enable_async_completion,
+                 true);
   if (enable_xla_ops) {
     // Enable async completion when XLA ops are enabled. Sine the XLA runtime is
     // single-threaded, async completion is essential to reduce host overhead.
@@ -589,9 +637,11 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
   }
 
   // Set chunk size for MPI based Adasum allreduce algorithms
-  auto horovod_adasum_mpi_chunk_size = std::getenv(HOROVOD_ADASUM_MPI_CHUNK_SIZE);
+  auto horovod_adasum_mpi_chunk_size =
+      std::getenv(HOROVOD_ADASUM_MPI_CHUNK_SIZE);
   if (horovod_adasum_mpi_chunk_size != nullptr) {
-    state.adasum_mpi_chunk_size = std::strtol(horovod_adasum_mpi_chunk_size, nullptr, 10);
+    state.adasum_mpi_chunk_size =
+        std::strtol(horovod_adasum_mpi_chunk_size, nullptr, 10);
   }
 
   op_manager.reset(CreateOperationManager(state));
@@ -606,7 +656,7 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
       int id;
       GetProcessSetOrAddUnitialized(process_set_ranks, id);
     }
-    int32_t initialized_count;
+    int32_t initialized_count = 0;
 #if HAVE_MPI
     if (state.control_operation == LibType::MPI) {
       initialized_count =
@@ -641,7 +691,8 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
 
   // Iterate until shutdown.
   try {
-    while (RunLoopOnce(state));
+    while (RunLoopOnce(state))
+      ;
   } catch (const std::exception& ex) {
     LOG(ERROR, horovod_global.global_controller->GetRank())
         << "Horovod background loop uncaught exception: " << ex.what();
@@ -651,6 +702,8 @@ shutdown:
   // Finalize all contexts
 #if HAVE_NCCL
   nccl_context.ShutDown();
+  local_nccl_context.ShutDown();
+  cross_nccl_context.ShutDown();
 #endif
 
   LOG(DEBUG, horovod_global.global_controller->GetRank())
@@ -689,11 +742,10 @@ shutdown:
 #endif
 
 #if HAVE_CCL
-  if (state.cpu_operation == LibType::CCL){
+  if (state.cpu_operation == LibType::CCL) {
     ccl_context.Finalize();
   }
 #endif
-
 }
 
 bool RunLoopOnce(HorovodGlobalState& state) {
@@ -753,7 +805,8 @@ bool RunLoopOnce(HorovodGlobalState& state) {
           state.timeline_controller.MarkCyclesInTimelinePending();
     }
 
-    // Get tensor name and size data for autotuning. // TODO: extend for all process sets?
+    // Get tensor name and size data for autotuning. // TODO: extend for all
+    // process sets?
     int64_t total_tensor_size = 0;
     std::vector<std::string> tensor_names;
     if (process_set_id == 0 && state.parameter_manager.IsAutoTuning()) {
@@ -838,8 +891,8 @@ bool InitializeHorovodOnce(
 #endif
     // Reset initialization flag
     horovod_global.initialization_done = false;
-    horovod_global.background_thread = std::thread(
-        BackgroundThreadLoop, std::ref(horovod_global));
+    horovod_global.background_thread =
+        std::thread(BackgroundThreadLoop, std::ref(horovod_global));
   }
 
   // Wait to ensure that the background thread has finished initializing MPI.
@@ -914,10 +967,11 @@ bool horovod_init_multi_comm(MPI_Comm* comm, int ncomms,
       MPI_Group diff_group;
       MPI_Group_difference(sub_group, global_group, &diff_group);
       if (diff_group != MPI_GROUP_EMPTY) {
-        LOG(ERROR) <<
-            "Group of processes in horovod_init_multi_comm argument number " +
-            std::to_string(i) +
-            " is not a subset of the assumed global communicator.";
+        LOG(ERROR)
+            << "Group of processes in horovod_init_multi_comm argument "
+               "number " +
+                   std::to_string(i) +
+                   " is not a subset of the assumed global communicator.";
         return false;
       }
     }
@@ -1016,8 +1070,8 @@ void horovod_shutdown() {
   }
 }
 
-bool horovod_is_initialized() {
-  return horovod_global.initialization_done;
+int horovod_is_initialized() {
+  return int(horovod_global.initialization_done.load());
 }
 
 int horovod_start_timeline(const char* file_name, bool mark_cycles) {
@@ -1033,7 +1087,8 @@ int horovod_start_timeline(const char* file_name, bool mark_cycles) {
         std::string(file_name), horovod_global.global_controller->GetSize());
     horovod_global.timeline.SetPendingTimelineFile(std::string(file_name));
   }
-  horovod_global.timeline_controller.SetMarkCyclesInTimelinePending(mark_cycles);
+  horovod_global.timeline_controller.SetMarkCyclesInTimelinePending(
+      mark_cycles);
   return 1;
 }
 
@@ -1041,13 +1096,14 @@ int horovod_stop_timeline() {
   if (!horovod_global.initialization_done) {
     return -1;
   }
-  if(!horovod_global.timeline_controller.TimelineEnabledPending()){
-    LOG(INFO) << " Timeline is already stopped. Please start timeline before stopping it.";
+  if (!horovod_global.timeline_controller.TimelineEnabledPending()) {
+    LOG(INFO) << " Timeline is already stopped. Please start timeline before "
+                 "stopping it.";
     return 1;
   }
   bool is_coordinator = horovod_global.global_controller->IsCoordinator();
   if (is_coordinator) {
-      horovod_global.timeline.SetPendingTimelineFile(std::string(""));
+    horovod_global.timeline.SetPendingTimelineFile(std::string(""));
   }
   return 1;
 }
@@ -1184,17 +1240,17 @@ bool horovod_rocm_built() {
 #endif
 }
 
-int horovod_reduce_op_average() {
-  return ReduceOp::AVERAGE;
-}
+int horovod_reduce_op_average() { return ReduceOp::AVERAGE; }
 
-int horovod_reduce_op_sum() {
-  return ReduceOp::SUM;
-}
+int horovod_reduce_op_sum() { return ReduceOp::SUM; }
 
-int horovod_reduce_op_adasum() {
-  return ReduceOp::ADASUM;
-}
+int horovod_reduce_op_adasum() { return ReduceOp::ADASUM; }
+
+int horovod_reduce_op_min() { return ReduceOp::MIN; }
+
+int horovod_reduce_op_max() { return ReduceOp::MAX; }
+
+int horovod_reduce_op_product() { return ReduceOp::PRODUCT; }
 
 const int HOROVOD_PROCESS_SET_ERROR_INIT = -1;
 const int HOROVOD_PROCESS_SET_ERROR_DYNAMIC = -2;
@@ -1320,7 +1376,6 @@ int horovod_process_set_included(int process_set_id) {
   return static_cast<int>(process_set.IsCurrentProcessIncluded());
 }
 
-
 int horovod_number_of_process_sets() {
   return static_cast<int>(horovod_global.process_set_table.Ids().size());
 }
@@ -1346,7 +1401,6 @@ int horovod_process_set_ranks(int id, int* ranks_prealloc) {
   }
   return 0;
 }
-
 }
 
 // Contexts and controller must be initialized and the background thread
@@ -1354,13 +1408,10 @@ int horovod_process_set_ranks(int id, int* ranks_prealloc) {
 Status EnqueueTensorAllreduce(std::shared_ptr<OpContext> context,
                               std::shared_ptr<Tensor> tensor,
                               std::shared_ptr<Tensor> output,
-                              ReadyEventList ready_event_list,
-                              std::string name, const int device,
-                              StatusCallback callback,
-                              ReduceOp reduce_op,
-                              double prescale_factor,
-                              double postscale_factor,
-                              int32_t process_set_id) {
+                              ReadyEventList ready_event_list, std::string name,
+                              const int device, StatusCallback callback,
+                              ReduceOp reduce_op, double prescale_factor,
+                              double postscale_factor, int32_t process_set_id) {
   // Wrap inputs in std::vector and pass onto multi tensor implementation
   std::vector<std::shared_ptr<OpContext>> contexts;
   std::vector<std::shared_ptr<Tensor>> tensors;
@@ -1376,44 +1427,36 @@ Status EnqueueTensorAllreduce(std::shared_ptr<OpContext> context,
   names.emplace_back(std::move(name));
   callbacks.emplace_back(std::move(callback));
 
-  return EnqueueTensorAllreduces(contexts, tensors, outputs, ready_event_lists,
-                                 names, device, callbacks, reduce_op,
-                                 prescale_factor, postscale_factor,
-                                 process_set_id);
+  return EnqueueTensorAllreduces(
+      contexts, tensors, outputs, ready_event_lists, names, device, callbacks,
+      reduce_op, prescale_factor, postscale_factor, process_set_id);
 }
 
-Status EnqueueTensorAllreduces(std::vector<std::shared_ptr<OpContext>>& contexts,
-                               std::vector<std::shared_ptr<Tensor>>& tensors,
-                               std::vector<std::shared_ptr<Tensor>>& outputs,
-                               std::vector<ReadyEventList>& ready_event_lists,
-                               std::vector<std::string>& names,
-                               const int device,
-                               std::vector<StatusCallback>& callbacks,
-                               ReduceOp reduce_op,
-                               double prescale_factor,
-                               double postscale_factor,
-                               int32_t process_set_id) {
+Status
+EnqueueTensorAllreduces(std::vector<std::shared_ptr<OpContext>>& contexts,
+                        std::vector<std::shared_ptr<Tensor>>& tensors,
+                        std::vector<std::shared_ptr<Tensor>>& outputs,
+                        std::vector<ReadyEventList>& ready_event_lists,
+                        std::vector<std::string>& names, const int device,
+                        std::vector<StatusCallback>& callbacks,
+                        ReduceOp reduce_op, double prescale_factor,
+                        double postscale_factor, int32_t process_set_id) {
   if (horovod_global.cpu_operation == LibType::CCL && process_set_id > 0 &&
-        device == CPU_DEVICE_ID) {
-      return Status::InvalidArgument(
-          "Process sets are not supported yet with oneCCL operations.");
+      device == CPU_DEVICE_ID) {
+    return Status::InvalidArgument(
+        "Process sets are not supported yet with oneCCL operations.");
   }
   if (!horovod_global.process_set_table.Contains(process_set_id)) {
     return Status::InvalidArgument("Allreduce: Process set provided does not "
                                    "exist, or has not been registered.");
   }
+  if (horovod_global.shut_down) {
+    return SHUT_DOWN_ERROR;
+  }
   auto& process_set = horovod_global.process_set_table.Get(process_set_id);
   Status status;
 
-  if (reduce_op == ReduceOp::AVERAGE) {
-#if !HAVE_ROCM
-    // Averaging happens via postscale_factor
-    postscale_factor /= process_set.controller->GetSize();
-#else
-    LOG(ERROR, horovod_global.global_controller->GetRank()) << "Enqueuing AVERAGE allreduce is not allowed.";
-    return status.Aborted("AVERAGE not allowed.");
-#endif
-  } else if (reduce_op == ReduceOp::ADASUM) {
+  if (reduce_op == ReduceOp::ADASUM) {
 #if HAVE_NCCL && !HAVE_ROCM
     if (device != CPU_DEVICE_ID) {
       // Averaging by local size happens via postscale_factor
@@ -1441,6 +1484,7 @@ Status EnqueueTensorAllreduces(std::vector<std::shared_ptr<OpContext>>& contexts
     } else {
       message.set_request_type(Request::ALLREDUCE);
     }
+    message.set_reduce_op(reduce_op);
 
     message.set_tensor_shape(tensors[n]->shape().to_vector());
     messages.push_back(std::move(message));
@@ -1492,10 +1536,12 @@ Status EnqueueTensorAllreduces(std::vector<std::shared_ptr<OpContext>>& contexts
   for (const auto& n : names) {
     tensors_enqueued += n + "; ";
   }
-  LOG(TRACE, horovod_global.global_controller->GetRank()) << "Enqueued " << tensors_enqueued;
+  LOG(TRACE, horovod_global.global_controller->GetRank())
+      << "Enqueued " << tensors_enqueued;
 
-  // Only create groups larger than 1 tensor, unless disable_group_fusion is requested.
-  // In that case, even single tensor groups are created to enforce disabling fusion.
+  // Only create groups larger than 1 tensor, unless disable_group_fusion is
+  // requested. In that case, even single tensor groups are created to enforce
+  // disabling fusion.
   if (tensors.size() > 1 || horovod_global.disable_group_fusion) {
     auto group_id = process_set.group_table.RegisterGroup(std::move(names));
     for (auto& message : messages) {
@@ -1503,9 +1549,6 @@ Status EnqueueTensorAllreduces(std::vector<std::shared_ptr<OpContext>>& contexts
     }
   }
 
-  if (horovod_global.shut_down) {
-    return SHUT_DOWN_ERROR;
-  }
   status = process_set.tensor_queue.AddToTensorQueueMulti(entries, messages);
 
   return status;
@@ -1517,8 +1560,33 @@ Status EnqueueTensorAllgather(std::shared_ptr<OpContext> context,
                               std::shared_ptr<Tensor> tensor,
                               ReadyEventList ready_event_list,
                               const std::string& name, const int device,
-                              StatusCallback callback,
-                              int32_t process_set_id) {
+                              StatusCallback callback, int32_t process_set_id) {
+  // Wrap inputs in std::vector and pass onto multi tensor implementation
+  std::vector<std::shared_ptr<OpContext>> contexts;
+  std::vector<std::shared_ptr<Tensor>> tensors;
+  std::vector<ReadyEventList> ready_event_lists;
+  std::vector<std::string> names;
+  std::vector<StatusCallback> callbacks;
+
+  contexts.emplace_back(std::move(context));
+  tensors.emplace_back(std::move(tensor));
+  ready_event_lists.emplace_back(std::move(ready_event_list));
+  names.emplace_back(std::move(name));
+  callbacks.emplace_back(std::move(callback));
+
+  return EnqueueTensorAllgathers(contexts, tensors, ready_event_lists, names,
+                                 device, callbacks, process_set_id);
+}
+
+// Contexts and controller must be initialized and the background thread
+// must be running before this function is called.
+Status
+EnqueueTensorAllgathers(std::vector<std::shared_ptr<OpContext>>& contexts,
+                        std::vector<std::shared_ptr<Tensor>>& tensors,
+                        std::vector<ReadyEventList>& ready_event_lists,
+                        std::vector<std::string>& names, int device,
+                        std::vector<StatusCallback>& callbacks,
+                        int32_t process_set_id) {
   if (horovod_global.cpu_operation == LibType::CCL && process_set_id > 0 &&
       device == CPU_DEVICE_ID) {
     return Status::InvalidArgument(
@@ -1527,6 +1595,9 @@ Status EnqueueTensorAllgather(std::shared_ptr<OpContext> context,
   if (!horovod_global.process_set_table.Contains(process_set_id)) {
     return Status::InvalidArgument("Allgather: Process set provided does not "
                                    "exist, or has not been registered.");
+  }
+  if (horovod_global.shut_down) {
+    return SHUT_DOWN_ERROR;
   }
   auto& process_set = horovod_global.process_set_table.Get(process_set_id);
 
@@ -1537,33 +1608,72 @@ Status EnqueueTensorAllgather(std::shared_ptr<OpContext> context,
         " is not a member of the provided process set.");
   }
 
-  Request message;
-  message.set_request_rank(process_set.controller->GetRank());
-  message.set_tensor_name(name);
-  message.set_tensor_type(tensor->dtype());
-  message.set_device(device);
-  message.set_request_type(Request::ALLGATHER);
-  for (int i = 0; i < tensor->shape().dims(); ++i) {
-    message.add_tensor_shape((int64_t)tensor->shape().dim_size(i));
+  std::vector<Request> messages;
+  std::vector<TensorTableEntry> entries;
+  messages.reserve(tensors.size());
+  entries.reserve(tensors.size());
+
+  for (int n = 0; n < (int)tensors.size(); ++n) {
+    Request message;
+    message.set_request_rank(process_set.controller->GetRank());
+    message.set_tensor_name(names[n]);
+    message.set_tensor_type(tensors[n]->dtype());
+    message.set_device(device);
+    message.set_request_type(Request::ALLGATHER);
+    message.set_tensor_shape(tensors[n]->shape().to_vector());
+
+    messages.push_back(std::move(message));
+
+    TensorTableEntry e;
+    e.tensor_name = names[n];
+    e.context = contexts[n];
+    e.tensor = tensors[n];
+    e.output_index = n;
+    e.process_set_id = process_set_id;
+    e.ready_event_list = std::move(ready_event_lists[n]);
+    e.device = device;
+    e.callback = std::move(callbacks[n]);
+
+    entries.push_back(std::move(e));
   }
 
-  TensorTableEntry e;
-  e.tensor_name = name;
-  e.context = context;
-  e.tensor = tensor;
-  e.process_set_id = process_set_id;
-  e.ready_event_list = ready_event_list;
-  e.device = device;
-  e.callback = callback;
-  e.nvtx_op_range.Start(RegisteredNvtxOp::HorovodAllgather, e.tensor->size());
+  // Start appropriate NVTX range
+  if (tensors.size() == 1) {
+    auto& e = entries[0];
+    e.nvtx_op_range.Start(RegisteredNvtxOp::HorovodAllgather, e.tensor->size());
+  } else {
+    auto total_size =
+        std::accumulate(entries.begin(), entries.end(), 0ll,
+                        [](int64_t size_sum, const TensorTableEntry& e) {
+                          return size_sum + e.tensor->size();
+                        });
+    SharedNvtxOpRange range;
+    range.Start(RegisteredNvtxOp::HorovodGroupedAllgather, total_size);
+    for (auto& e : entries) {
+      e.nvtx_op_range = range;
+    }
+  }
 
-  if (horovod_global.shut_down) {
-    return SHUT_DOWN_ERROR;
+  std::string tensors_enqueued;
+  for (const auto& n : names) {
+    tensors_enqueued += n + "; ";
   }
-  Status status = process_set.tensor_queue.AddToTensorQueue(e, message);
-  if (status.ok()) {
-    LOG(TRACE, horovod_global.global_controller->GetRank()) << "Enqueued " << name;
+  LOG(TRACE, horovod_global.global_controller->GetRank())
+      << "Enqueued tensors for Allgather: " << tensors_enqueued;
+
+  // Only create groups larger than 1 tensor, unless disable_group_fusion is
+  // requested. In that case, even single tensor groups are created to enforce
+  // disabling fusion.
+  if (tensors.size() > 1 || horovod_global.disable_group_fusion) {
+    auto group_id = process_set.group_table.RegisterGroup(std::move(names));
+    for (auto& message : messages) {
+      message.set_group_id(group_id);
+    }
   }
+
+  Status status =
+      process_set.tensor_queue.AddToTensorQueueMulti(entries, messages);
+
   return status;
 }
 
@@ -1574,8 +1684,7 @@ Status EnqueueTensorBroadcast(std::shared_ptr<OpContext> context,
                               std::shared_ptr<Tensor> output, int root_rank,
                               ReadyEventList ready_event_list,
                               const std::string& name, const int device,
-                              StatusCallback callback,
-                              int32_t process_set_id) {
+                              StatusCallback callback, int32_t process_set_id) {
   if (horovod_global.cpu_operation == LibType::CCL && process_set_id > 0 &&
       device == CPU_DEVICE_ID) {
     return Status::InvalidArgument(
@@ -1585,6 +1694,9 @@ Status EnqueueTensorBroadcast(std::shared_ptr<OpContext> context,
     return Status::InvalidArgument("Broadcast: Process set provided does not "
                                    "exist, or has not been registered.");
   }
+  if (horovod_global.shut_down) {
+    return SHUT_DOWN_ERROR;
+  }
   auto& process_set = horovod_global.process_set_table.Get(process_set_id);
 
   int root_rank_in_process_set;
@@ -1592,9 +1704,9 @@ Status EnqueueTensorBroadcast(std::shared_ptr<OpContext> context,
     root_rank_in_process_set =
         process_set.controller->GetGlobalRankToControllerRank().at(root_rank);
   } catch (const std::out_of_range& e) {
-    return Status::InvalidArgument(
-        "broadcast received invalid root rank " + std::to_string(root_rank) +
-        " for provided process set");
+    return Status::InvalidArgument("broadcast received invalid root rank " +
+                                   std::to_string(root_rank) +
+                                   " for provided process set");
   }
 
   Request message;
@@ -1627,13 +1739,163 @@ Status EnqueueTensorBroadcast(std::shared_ptr<OpContext> context,
         " is not a member of the provided process set.");
   }
 
+  Status status = process_set.tensor_queue.AddToTensorQueue(e, message);
+  if (status.ok()) {
+    LOG(TRACE, horovod_global.global_controller->GetRank())
+        << "Enqueued " << name;
+  }
+  return status;
+}
+
+// Contexts and controller must be initialized and the background thread
+// must be running before this function is called.
+Status EnqueueTensorReducescatter(
+    std::shared_ptr<OpContext> context, std::shared_ptr<Tensor> tensor,
+    std::shared_ptr<Tensor> output, ReadyEventList ready_event_list,
+    const std::string& name, const int device, StatusCallback callback,
+    ReduceOp reduce_op, int32_t process_set_id, double prescale_factor,
+    double postscale_factor) {
+  // Wrap inputs in std::vector and pass onto multi tensor implementation
+  std::vector<std::shared_ptr<OpContext>> contexts;
+  std::vector<std::shared_ptr<Tensor>> tensors;
+  std::vector<std::shared_ptr<Tensor>> outputs;
+  std::vector<ReadyEventList> ready_event_lists;
+  std::vector<std::string> names;
+  std::vector<StatusCallback> callbacks;
+
+  contexts.emplace_back(std::move(context));
+  tensors.emplace_back(std::move(tensor));
+  outputs.emplace_back(std::move(output));
+  ready_event_lists.emplace_back(std::move(ready_event_list));
+  names.emplace_back(std::move(name));
+  callbacks.emplace_back(std::move(callback));
+
+  return EnqueueTensorReducescatters(
+      contexts, tensors, outputs, ready_event_lists, names, device, callbacks,
+      reduce_op, process_set_id, prescale_factor, postscale_factor);
+}
+
+// Contexts and controller must be initialized and the background thread
+// must be running before this function is called.
+Status
+EnqueueTensorReducescatters(std::vector<std::shared_ptr<OpContext>>& contexts,
+                            std::vector<std::shared_ptr<Tensor>>& tensors,
+                            std::vector<std::shared_ptr<Tensor>>& outputs,
+                            std::vector<ReadyEventList>& ready_event_lists,
+                            std::vector<std::string>& names, int device,
+                            std::vector<StatusCallback>& callbacks,
+                            ReduceOp reduce_op, int32_t process_set_id,
+                            double prescale_factor, double postscale_factor) {
+  if (horovod_global.cpu_operation == LibType::CCL && device == CPU_DEVICE_ID) {
+    return Status::InvalidArgument(
+        "Reducescatter is not supported yet with oneCCL operations.");
+  }
+  if (!horovod_global.process_set_table.Contains(process_set_id)) {
+    return Status::InvalidArgument(
+        "Reducescatter: Process set provided does not "
+        "exist, or has not been registered.");
+  }
   if (horovod_global.shut_down) {
     return SHUT_DOWN_ERROR;
   }
-  Status status = process_set.tensor_queue.AddToTensorQueue(e, message);
-  if (status.ok()) {
-    LOG(TRACE, horovod_global.global_controller->GetRank()) << "Enqueued " << name;
+
+  auto& process_set = horovod_global.process_set_table.Get(process_set_id);
+  switch (reduce_op) {
+
+  case ReduceOp::AVERAGE:
+#if !HAVE_ROCM
+    // Averaging happens via postscale_factor
+    postscale_factor /= process_set.controller->GetSize();
+#else
+    LOG(ERROR, horovod_global.global_controller->GetRank())
+        << "Enqueuing AVERAGE reducescatter is not allowed with ROCm.";
+    return Status::Aborted("AVERAGE not allowed.");
+#endif
+    break;
+  case ReduceOp::SUM:
+    break;
+  default:
+    LOG(ERROR, horovod_global.global_controller->GetRank())
+        << "Reducescatter currently only supports AVERAGE and SUM.";
+    return Status::Aborted(
+        "Reducescatter currently only supports AVERAGE and SUM.");
   }
+
+  if (!process_set.IsCurrentProcessIncluded()) {
+    return Status::InvalidArgument(
+        "Reducescatter: Rank " +
+        std::to_string(horovod_global.global_controller->GetRank()) +
+        " is not a member of the provided process set.");
+  }
+
+  std::vector<Request> messages;
+  std::vector<TensorTableEntry> entries;
+  messages.reserve(tensors.size());
+  entries.reserve(tensors.size());
+
+  for (int n = 0; n < (int)tensors.size(); ++n) {
+    Request message;
+    message.set_request_rank(process_set.controller->GetRank());
+    message.set_tensor_name(names[n]);
+    message.set_tensor_type(tensors[n]->dtype());
+    message.set_device(device);
+    message.set_request_type(Request::REDUCESCATTER);
+    message.set_tensor_shape(tensors[n]->shape().to_vector());
+    message.set_prescale_factor(prescale_factor);
+    message.set_postscale_factor(postscale_factor);
+    messages.push_back(std::move(message));
+
+    TensorTableEntry e;
+    e.tensor_name = names[n];
+    e.context = std::move(contexts[n]);
+    e.tensor = tensors[n];
+    e.output = outputs[n];
+    e.process_set_id = process_set_id;
+    e.ready_event_list = std::move(ready_event_lists[n]);
+    e.device = device;
+    e.callback = std::move(callbacks[n]);
+
+    entries.push_back(std::move(e));
+  }
+
+  // Start appropriate NVTX range
+  if (tensors.size() == 1) {
+    auto& e = entries[0];
+    e.nvtx_op_range.Start(RegisteredNvtxOp::HorovodReducescatter,
+                          e.tensor->size());
+  } else {
+    auto total_size =
+        std::accumulate(entries.begin(), entries.end(), 0ll,
+                        [](int64_t size_sum, const TensorTableEntry& e) {
+                          return size_sum + e.tensor->size();
+                        });
+    SharedNvtxOpRange range;
+    range.Start(RegisteredNvtxOp::HorovodGroupedReducescatter, total_size);
+    for (auto& e : entries) {
+      e.nvtx_op_range = range;
+    }
+  }
+
+  std::string tensors_enqueued;
+  for (const auto& n : names) {
+    tensors_enqueued += n + "; ";
+  }
+  LOG(TRACE, horovod_global.global_controller->GetRank())
+      << "Enqueued tensors for Reducescatter: " << tensors_enqueued;
+
+  // Only create groups larger than 1 tensor, unless disable_group_fusion is
+  // requested. In that case, even single tensor groups are created to enforce
+  // disabling fusion.
+  if (tensors.size() > 1 || horovod_global.disable_group_fusion) {
+    auto group_id = process_set.group_table.RegisterGroup(std::move(names));
+    for (auto& message : messages) {
+      message.set_group_id(group_id);
+    }
+  }
+
+  Status status =
+      process_set.tensor_queue.AddToTensorQueueMulti(entries, messages);
+
   return status;
 }
 
@@ -1644,8 +1906,7 @@ Status EnqueueTensorAlltoall(std::shared_ptr<OpContext> context,
                              std::shared_ptr<Tensor> splits,
                              ReadyEventList ready_event_list,
                              const std::string& name, const int device,
-                             StatusCallback callback,
-                             int32_t process_set_id) {
+                             StatusCallback callback, int32_t process_set_id) {
   if (horovod_global.cpu_operation == LibType::CCL && process_set_id > 0 &&
       device == CPU_DEVICE_ID) {
     return Status::InvalidArgument(
@@ -1655,6 +1916,9 @@ Status EnqueueTensorAlltoall(std::shared_ptr<OpContext> context,
     return Status::InvalidArgument("Alltoall: Process set provided does not "
                                    "exist, or has not been registered.");
   }
+  if (horovod_global.shut_down) {
+    return SHUT_DOWN_ERROR;
+  }
   auto& process_set = horovod_global.process_set_table.Get(process_set_id);
 
   // Check arguments
@@ -1662,7 +1926,8 @@ Status EnqueueTensorAlltoall(std::shared_ptr<OpContext> context,
     return Status::InvalidArgument("alltoall expects a 1D splits tensor");
   }
   if (splits->dtype() != HOROVOD_INT32) {
-    return Status::InvalidArgument("alltoall expects splits to contain 32-bit integer elements.");
+    return Status::InvalidArgument(
+        "alltoall expects splits to contain 32-bit integer elements.");
   }
 
   Request message;
@@ -1697,26 +1962,26 @@ Status EnqueueTensorAlltoall(std::shared_ptr<OpContext> context,
     auto splits_data = static_cast<const int32_t*>(splits->data());
     auto sum = std::accumulate(splits_data, splits_data + splits_first_dim, 0);
     if (sum > tensor_first_dim) {
-      return Status::InvalidArgument("Sum of splits entries is greater than the first dimension of tensor.");
+      return Status::InvalidArgument("Sum of splits entries is greater than "
+                                     "the first dimension of tensor.");
     }
-    e.splits.assign(splits_data,
-                    splits_data + splits->shape().num_elements());
+    e.splits.assign(splits_data, splits_data + splits->shape().num_elements());
   } else if (splits_first_dim == 0) {
     if (tensor_first_dim % world_size != 0) {
-      return Status::InvalidArgument("splits not provided, but first dimension of tensor is not an even "
-                                     "multiple of the number of workers.");
+      return Status::InvalidArgument(
+          "splits not provided, but first dimension of tensor is not an even "
+          "multiple of the number of workers.");
     }
     e.splits.resize(world_size, tensor_first_dim / world_size);
   } else {
-      return Status::InvalidArgument("Number of entries in splits does not equal number of workers.");
+    return Status::InvalidArgument(
+        "Number of entries in splits does not equal number of workers.");
   }
 
-  if (horovod_global.shut_down) {
-    return SHUT_DOWN_ERROR;
-  }
   Status status = process_set.tensor_queue.AddToTensorQueue(e, message);
   if (status.ok()) {
-    LOG(TRACE, horovod_global.global_controller->GetRank()) << "Enqueued " << name;
+    LOG(TRACE, horovod_global.global_controller->GetRank())
+        << "Enqueued " << name;
   }
   return status;
 }
@@ -1725,10 +1990,12 @@ Status EnqueueTensorAlltoall(std::shared_ptr<OpContext> context,
 // must be running before this function is called.
 Status EnqueueJoin(std::shared_ptr<OpContext> context,
                    std::shared_ptr<Tensor> output_last_joined_rank,
-                   ReadyEventList ready_event_list,
-                   const std::string& name, const int device,
-                   StatusCallback callback,
+                   ReadyEventList ready_event_list, const std::string& name,
+                   const int device, StatusCallback callback,
                    int32_t process_set_id) {
+  if (horovod_global.shut_down) {
+    return SHUT_DOWN_ERROR;
+  }
   auto& process_set = horovod_global.process_set_table.Get(process_set_id);
 
   Request message;
@@ -1745,13 +2012,47 @@ Status EnqueueJoin(std::shared_ptr<OpContext> context,
   e.device = device;
   e.callback = callback;
 
+  Status status = process_set.tensor_queue.AddToTensorQueue(e, message);
+  if (status.ok()) {
+    LOG(TRACE, horovod_global.global_controller->GetRank())
+        << "Enqueued " << name;
+  }
+  return status;
+}
+
+// Contexts and controller must be initialized and the background thread
+// must be running before this function is called.
+Status EnqueueBarrier(StatusCallback callback, int32_t process_set_id) {
   if (horovod_global.shut_down) {
     return SHUT_DOWN_ERROR;
   }
+  auto& process_set = horovod_global.process_set_table.Get(process_set_id);
+
+  if (!process_set.IsCurrentProcessIncluded()) {
+    return Status::InvalidArgument(
+        "Barrier: Rank " +
+        std::to_string(horovod_global.global_controller->GetRank()) +
+        " is not a member of the provided process set.");
+  }
+
+  Request message;
+  // Barrier doesn't need a tensor, we set an arbitrary name for tracing
+  // purposes.
+  message.set_tensor_name(BARRIER_TENSOR_NAME);
+  message.set_request_rank(process_set.controller->GetRank());
+  message.set_request_type(Request::BARRIER);
+
+  TensorTableEntry e;
+  e.tensor_name = BARRIER_TENSOR_NAME;
+  e.process_set_id = process_set_id;
+  e.callback = callback;
+
   Status status = process_set.tensor_queue.AddToTensorQueue(e, message);
   if (status.ok()) {
-    LOG(TRACE, horovod_global.global_controller->GetRank()) << "Enqueued " << name;
+    LOG(TRACE, horovod_global.global_controller->GetRank())
+        << "Enqueued barrier op";
   }
+
   return status;
 }
 

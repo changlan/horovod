@@ -18,7 +18,7 @@ import os
 import sys
 import itertools
 import unittest
-from distutils.version import LooseVersion
+from packaging import version
 
 import pytest
 import numpy as np
@@ -28,7 +28,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), os.pardir, 'utils'))
 from base_test_mxnet import *
 
 
-@pytest.mark.skipif(LooseVersion(mx.__version__) < LooseVersion('2.0.0'), reason='MXNet v2 tests')
+@pytest.mark.skipif(version.parse(mx.__version__).major != 2, reason='MXNet v2 tests')
 class MX2Tests(MXTests, unittest.TestCase):
     """
     Tests for ops in horovod.mxnet. This tests MXNet 2.x specifically.
@@ -152,8 +152,8 @@ class MX2Tests(MXTests, unittest.TestCase):
 
         data_gen = gen_random_dataset()
         for (src_data, dst_data) in data_gen:
-            src_data = src_data.as_in_ctx(ctx).astype(np.float32)
-            dst_data = dst_data.as_in_ctx(ctx).astype(np.float32)
+            src_data = src_data.as_in_context(ctx).astype(np.float32)
+            dst_data = dst_data.as_in_context(ctx).astype(np.float32)
             with mx.autograd.record():
                 pred = net(src_data)
                 loss = mx.np.abs(pred - dst_data).mean()

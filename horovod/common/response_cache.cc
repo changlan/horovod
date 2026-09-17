@@ -39,6 +39,8 @@ static Response::ResponseType RequestTypeToResponseType(Request::RequestType val
       return Response::ResponseType::ADASUM;
     case Request::RequestType::ALLTOALL:
       return Response::ResponseType::ALLTOALL;
+    case Request::RequestType::BARRIER:
+      return Response::ResponseType::BARRIER;
     default:
       throw std::logic_error("No corresponding ResponseType for provided RequestType.");
   }
@@ -79,6 +81,7 @@ ResponseCache::CacheState ResponseCache::cached(const Request& message) const {
             cache_params.shape == message.tensor_shape() &&
             cache_response.prescale_factor() == message.prescale_factor() &&
             cache_response.postscale_factor() == message.postscale_factor() &&
+            cache_response.reduce_op() == message.reduce_op() &&
             cache_response.response_type() == RequestTypeToResponseType(message.request_type()))
                ? CacheState::HIT
                : CacheState::INVALID;
@@ -115,6 +118,7 @@ ResponseCache::cached(const Response& response,
             cache_params.dtype == params.dtype && same_shape &&
             cache_response.prescale_factor() == response.prescale_factor() &&
             cache_response.postscale_factor() == response.postscale_factor() &&
+            cache_response.reduce_op() == response.reduce_op() &&
             cache_response.response_type() == response.response_type())
                ? CacheState::HIT
                : CacheState::INVALID;
@@ -209,6 +213,7 @@ void ResponseCache::put(const Response& response, TensorQueue& tensor_queue, boo
       new_response.set_tensor_type(response.tensor_type());
       new_response.set_prescale_factor(response.prescale_factor());
       new_response.set_postscale_factor(response.postscale_factor());
+      new_response.set_reduce_op(response.reduce_op());
 
       // Populate tensor parameters from tensor_queue entry
       TensorParams params;
